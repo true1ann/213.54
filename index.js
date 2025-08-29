@@ -1,7 +1,7 @@
 import express from 'express'
 import express_ws from 'express-ws'
 import { v4 as uuidv4 } from "uuid";
-import { configStuff, normalize } from './functions.js'
+import { configStuff, normalize, generatePCMBuffer } from './functions.js'
 import path from 'path'
 import crypto from 'crypto'
 
@@ -57,21 +57,26 @@ app.post('/api/makeSession', (req, res) => {
                 s.msptu == msptu
             ) {
                 console.log(`[${new Date().toLocaleString()}]`, '[Main] Duplicate session @w@;', s.id)
-                res.status(200).json({ ...s, type: 'reuse' })
+                res.status(200).json({ ...s, new: false })
                 newSession = false
             }
         })
 
         if (newSession) {
-            const hash = crypto.createHash('sha256').update(pitchSeed).digest('hex')
-            const hashNumber = BigInt('0x' + hash)
+            const listener = pitchSeed == undefined || pitchSeed == 'undefined' || pitchSeed == null || pitchSeed == 'null'
+            if (listener) {
+                sessions.set(id, {freq, id, listener})
+            } else {
+                const hash = crypto.createHash('sha256').update(pitchSeed).digest('hex')
+                const hashNumber = BigInt('0x' + hash)
 
-            const pitch = config.caps.pitch[0] + (Number(hashNumber % BigInt(1e18)) / 1e18) * (config.caps.pitch[1] - config.caps.pitch[0])
+                const pitch = config.caps.pitch[0] + (Number(hashNumber % BigInt(1e18)) / 1e18) * (config.caps.pitch[1] - config.caps.pitch[0])
 
-            sessions.set(id, { msptu, pitch, pitchSeed, freq, id })
+                sessions.set(id, { msptu, pitch, pitchSeed, freq, id, listener})
+            }
             const session = sessions.get(id)
             console.log(`[${new Date().toLocaleString()}]`, '[Main] Made session;', { ...session, type: 'new' })
-            res.status(200).json({ ...session, type: 'new' })
+            res.status(200).json({ ...session, new: true })
             if (!freqs.get(freq)) freqs.set(freq, { name: freq, sessions: [] })
         }
     } catch (e) {
@@ -82,7 +87,6 @@ app.post('/api/makeSession', (req, res) => {
 
 app.ws('/api/radio/:id', (ws, req) => {
     const id = req.params.id
-    const sendType = Number(req.params.mode) || 1
     console.log(`[${new Date().toLocaleString()}]`, '[Main] Session activated >w<;', id)
     const session = sessions.get(id)
     if (!session) {
@@ -101,35 +105,40 @@ app.ws('/api/radio/:id', (ws, req) => {
     } else {
         ws.send(JSON.stringify({ message: 'connected', session, status: 'activate'}))
         Object.defineProperty(session, 'ws', { value: ws, enumerable: false, writable: true })
+        Object.defineProperty(session, 'mode', { value: Number(req.query.mode) || 1, enumerable: false, writable: true })
 		bucket.sessions.push(session)
 	}
 
     ws.on('message', m => {
-        m = String(m).trim() // Im lazy
-        console.log(`[${new Date().toLocaleString()}]`, '[Main] Message;', id, `"${m}"`)
-        const nm = normalize(m)
-        console.log(`[${new Date().toLocaleString()}]`, '[Main] Normalized message;', id, `"${nm}"`)
-        ws.send(JSON.stringify({ message: 'OK', details: nm, status: 'sent'}))
-        bucket.sessions.forEach(s => {
-            if (s.ws && s.ws.readyState === 1 && s.id !== session.id) {
-                try {
-                    switch (sendType) {
-                        // case 1 is the default
-                        case 2:
-                            // send base64 encoded PCM
-                            break
-                        case 3:
-                            s.ws.send(JSON.stringify({ message: nm, pitch, msptu }))
-                            break
-                        default:
-                            // send raw PCM
-                            break
+        if (session.listener) {
+            ws.send(JSON.stringify({ message: "SessionListenerOnly", error: "SessionListenerOnly", status: 'ignore'}))
+        } else {
+            m = String(m).trim() // Im lazy
+            console.log(`[${new Date().toLocaleString()}]`, '[Main] Message;', id, `"${m}"`)
+            const nm = normalize(m)
+            console.log(`[${new Date().toLocaleString()}]`, '[Main] Normalized message;', id, `"${nm}"`)
+            ws.send(JSON.stringify({ message: 'OK', details: nm, status: 'sent'}))
+            bucket.sessions.forEach(s => {
+                if (s.ws && s.ws.readyState === 1 && s.id !== session.id) {
+                    try {
+                        switch (s.mode) {
+                            // case 1 is the default
+                            case 2:
+                                s.ws.send(generatePCMBuffer(session, nm, true))
+                                break
+                            case 3:
+                                s.ws.send(JSON.stringify({ message: nm, pitch: session.pitch, msptu: session.msptu }))
+                                break
+                            default:
+                                s.ws.send(generatePCMBuffer(session, nm, false))
+                                break
+                        }
+                    } catch (e) {
+                        console.error(`[${new Date().toLocaleString()}]`, '[Main]', e)
                     }
-                } catch (e) {
-                    console.error(`[${new Date().toLocaleString()}]`, '[Main]', e)
                 }
-            }
-        })
+            })
+        }
     })
 
     ws.on('close', () => {
