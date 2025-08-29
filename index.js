@@ -1,13 +1,12 @@
 import express from 'express'
 import express_ws from 'express-ws'
 import { v4 as uuidv4 } from "uuid";
-import { configStuff } from './functions.js'
+import { configStuff, normalize } from './functions.js'
 import path from 'path'
 import crypto from 'crypto'
 
 // Fuck ES6
 import { fileURLToPath } from 'url';
-import { Session } from 'inspector/promises';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -33,7 +32,8 @@ app.get('/api/version', (req, res) => {
 })
 
 app.post('/api/makeSession', (req, res) => {
-    const id = uuidv4().replaceAll('-', '')
+    let id = uuidv4().replaceAll('-', '')
+    while (sessions.get(id)) id = uuidv4().replaceAll('-', '')
     try {
         const freq = String(req.body.freq)
         const pitchSeed = String(req.body.pitchSeed)
@@ -47,15 +47,34 @@ app.post('/api/makeSession', (req, res) => {
             msptu = config.caps.msptu[1];
         }
 
-        const hash = crypto.createHash('sha256').update(pitchSeed).digest('hex')
-        const hashNumber = BigInt('0x' + hash)
+        // check if session already exists
+        let newSession = true
+        sessions.values().forEach(s => {
+            if (
+                newSession &&
+                s.freq == freq &&
+                s.pitchSeed == pitchSeed &&
+                s.msptu == msptu
+            ) {
+                console.log('[Main] Duplicate session @w@;', s.id)
+                res.status(200).json({ ...s, type: 'reuse' })
+                newSession = false
+            }
+        })
 
-        const pitch = config.caps.pitch[0] + (Number(hashNumber % BigInt(1e18)) / 1e18) * (config.caps.pitch[1] * config.caps.pitch[0])
+        if (newSession) {
+            const hash = crypto.createHash('sha256').update(pitchSeed).digest('hex')
+            const hashNumber = BigInt('0x' + hash)
 
-        sessions.set(id, { msptu, pitch, pitchSeed, freq, id })
-        res.status(200).json({ session: sessions.get(id) })
-        console.log('[Main] Made session;', sessions.get(id))
+            const pitch = config.caps.pitch[0] + (Number(hashNumber % BigInt(1e18)) / 1e18) * (config.caps.pitch[1] - config.caps.pitch[0])
+
+            sessions.set(id, { msptu, pitch, pitchSeed, freq, id })
+            const session = sessions.get(id)
+            console.log('[Main] Made session;', { ...session, type: 'new' })
+            res.status(200).json({ ...session, type: 'new' })
+        }
     } catch (e) {
+        console.error('[Main]', e)
         res.status(500).json({ error: e.message, message: 'Internal server error'})
     }
 })
@@ -67,12 +86,20 @@ app.ws('/api/radio/:id', (ws, req) => {
     if (!session) {
         console.log('[Main] ...nevermind -w-;', id, 'ERR:InvalidSession')
         ws.send(JSON.stringify({ message: "InvalidSession", error: "InvalidSession", status: 'close'}))
-        ws.close()
+        ws.terminate() // sometimes ws.close fails so we use this instead
     }
 
     // there should an arg-related comment but i decided 'not yet', check back later.
 
     ws.send(JSON.stringify({ message: 'connected', session, status: 'activate'}))
+
+    ws.on('message', m => {
+        m = String(m).trim() // Im lazy
+        console.log('[Main] Message;', id, `"${m}"`)
+        const nm = normalize(m)
+        console.log('[Main] Normalized message;', id, `"${nm}"`)
+        ws.send(JSON.stringify({ message: 'OK', details: nm, status: 'sent'}))
+    })
 
     ws.on('close', () => {
         console.log('[Main] Session deactivated TwT;', id)
